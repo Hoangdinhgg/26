@@ -81,56 +81,107 @@ jobs:
           echo "cores=$CORES" >> $GITHUB_OUTPUT
           echo "host_cores=$HOST_CORES" >> $GITHUB_OUTPUT
 
-      - name: Download GCC + in-tree prerequisites (if not cached)
+      - name: Download GCC + in-tree prerequisites (robust, with retries & mirrors)
         run: |
           set -euo pipefail
           mkdir -p thirdparty
           cd thirdparty
 
+          # Robust downloader: try multiple URLs, with curl retries and timeouts
           download_and_extract() {
-            url="$1"
-            out="$2"
-            echo "Downloading $url -> $out"
-            curl -fL -o "$out" "$url"
-            # quick validation
-            if ! tar -tf "$out" >/dev/null 2>&1; then
-              echo "ERROR: $out not a valid tar archive"
-              file "$out" || true
-              head -c 512 "$out" | sed -n '1,200p' || true
-              exit 2
-            fi
-            tar -xf "$out"
-            rm -f "$out" || true
+            namestr="$1"    # human name for logs
+            out="$2"       # output filename
+            shift 2
+            urls=("$@")    # list of candidate URLs (space-separated args)
+
+            echo "==> download_and_extract: ${namestr}"
+            for url in "${urls[@]}"; do
+              echo "Trying URL: $url"
+              # curl options:
+              # -f : fail on http errors
+              # -L : follow redirects
+              # --retry / --retry-connrefused / --retry-delay : retry logic
+              # --connect-timeout : secs to wait for connection
+              # --max-time : total time
+              if curl -fL --retry 6 --retry-connrefused --retry-delay 5 \
+                       --connect-timeout 15 --max-time 300 -o "$out" "$url"; then
+                echo "Downloaded from $url -> $out"
+                # quick validation: ensure tar can list it
+                if tar -tf "$out" >/dev/null 2>&1; then
+                  echo "Archive $out looks valid; extracting..."
+                  tar -xf "$out"
+                  rm -f "$out" || true
+                  return 0
+                else
+                  echo "Downloaded file $out from $url is not a valid tar archive; inspecting head"
+                  file "$out" || true
+                  head -c 512 "$out" | sed -n '1,200p' || true
+                  rm -f "$out" || true
+                fi
+              else
+                echo "Failed to download from $url (curl exit $?); trying next mirror..."
+                rm -f "$out" || true
+                sleep 2
+              fi
+            done
+            echo "ERROR: All mirrors failed for ${namestr}"
+            return 1
           }
 
+          # GCC
           if [ ! -d "gcc-src" ]; then
-            download_and_extract "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz" "gcc.tar.xz"
+            download_and_extract "GCC ${GCC_VERSION}" "gcc.tar.xz" \
+              "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz" \
+              "https://mirrors.kernel.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz"
             mv "gcc-${GCC_VERSION}" gcc-src
           else
-            echo "gcc-src already exists (cache)"
+            echo "gcc-src exists - using cache"
           fi
 
-          # in-tree prerequisites to avoid ABI mismatches with brew libs
+          # GMP - prefer ftp.gnu mirror if gmplib.org unreachable
           if [ ! -d "gcc-src/gmp" ]; then
-            download_and_extract "https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz" "gmp.tar.xz"
+            download_and_extract "GMP ${GMP_VERSION}" "gmp.tar.xz" \
+              "https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz" \
+              "https://ftp.gnu.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz" \
+              "https://mirrors.kernel.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz"
             mv "gmp-${GMP_VERSION}" gcc-src/gmp
+          else
+            echo "gmp already present"
           fi
 
+          # MPFR - prefer ftp.gnu
           if [ ! -d "gcc-src/mpfr" ]; then
-            download_and_extract "https://www.mpfr.org/mpfr-${MPFR_VERSION}/mpfr-${MPFR_VERSION}.tar.xz" "mpfr.tar.xz"
+            download_and_extract "MPFR ${MPFR_VERSION}" "mpfr.tar.xz" \
+              "https://www.mpfr.org/mpfr-${MPFR_VERSION}/mpfr-${MPFR_VERSION}.tar.xz" \
+              "https://ftp.gnu.org/gnu/mpfr/mpfr-${MPFR_VERSION}.tar.xz" \
+              "https://mirrors.kernel.org/gnu/mpfr/mpfr-${MPFR_VERSION}.tar.xz"
             mv "mpfr-${MPFR_VERSION}" gcc-src/mpfr
+          else
+            echo "mpfr already present"
           fi
 
+          # MPC - use ftp.gnu first then mirror
           if [ ! -d "gcc-src/mpc" ]; then
-            download_and_extract "https://ftp.gnu.org/gnu/mpc/mpc-${MPC_VERSION}.tar.gz" "mpc.tar.gz"
+            download_and_extract "MPC ${MPC_VERSION}" "mpc.tar.gz" \
+              "https://ftp.gnu.org/gnu/mpc/mpc-${MPC_VERSION}.tar.gz" \
+              "https://mirrors.kernel.org/gnu/mpc/mpc-${MPC_VERSION}.tar.gz"
             mv "mpc-${MPC_VERSION}" gcc-src/mpc
+          else
+            echo "mpc already present"
           fi
 
+          # ISL - try ftp.gnu then sourceforge
           if [ ! -d "gcc-src/isl" ]; then
-            download_and_extract "https://libisl.sourceforge.io/isl-${ISL_VERSION}.tar.xz" "isl.tar.xz"
+            download_and_extract "ISL ${ISL_VERSION}" "isl.tar.xz" \
+              "https://libisl.sourceforge.io/isl-${ISL_VERSION}.tar.xz" \
+              "https://ftp.gnu.org/gnu/isl/isl-${ISL_VERSION}.tar.xz" \
+              "https://mirrors.kernel.org/gnu/isl/isl-${ISL_VERSION}.tar.xz"
             mv "isl-${ISL_VERSION}" gcc-src/isl
+          else
+            echo "isl already present"
           fi
 
+          echo "Thirdparty prepared (du):"
           du -sh . || true
           ls -la || true
 
@@ -203,9 +254,6 @@ jobs:
           TARGETROOT="${IR}${{ env.PREFIX }}"
           echo "Installroot size before cleanup:"
           du -sh "$IR" || true
-          # strip static libs (attempt; safe)
-          find "$TARGETROOT" -type f -name "*.a" -print0 | xargs -0 -n1 true 2>/dev/null || true
-          # remove docs/man
           rm -rf "$TARGETROOT"/share/man || true
           rm -rf "$TARGETROOT"/share/doc || true
           echo "Installroot size after cleanup:"
@@ -225,13 +273,12 @@ jobs:
       - name: Install fpm (macOS)
         run: |
           set -euo pipefail
-          gem install --no-document fpm
+          gem install --no-document fpm || true
 
       - name: Build .deb + zip
         run: |
           set -euo pipefail
           cd build/${{ env.DESTDIR_REL }}
-          # fpm creates .deb rooted at /usr/local/gcc-ios
           fpm -s dir -t deb -n gcc-ios -v "${{ env.GCC_VERSION }}" --architecture arm64 \
             --description "GCC + G++ + GFortran for aarch64-apple-ios (prefix /usr/local/gcc-ios)" \
             usr/local/gcc-ios

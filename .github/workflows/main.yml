@@ -87,39 +87,30 @@ jobs:
           mkdir -p thirdparty
           cd thirdparty
 
-          # Robust downloader: try multiple URLs, with curl retries and timeouts
           download_and_extract() {
-            namestr="$1"    # human name for logs
-            out="$2"       # output filename
+            namestr="$1"
+            out="$2"
             shift 2
-            urls=("$@")    # list of candidate URLs (space-separated args)
-
+            urls=("$@")
             echo "==> download_and_extract: ${namestr}"
             for url in "${urls[@]}"; do
               echo "Trying URL: $url"
-              # curl options:
-              # -f : fail on http errors
-              # -L : follow redirects
-              # --retry / --retry-connrefused / --retry-delay : retry logic
-              # --connect-timeout : secs to wait for connection
-              # --max-time : total time
               if curl -fL --retry 6 --retry-connrefused --retry-delay 5 \
-                       --connect-timeout 15 --max-time 300 -o "$out" "$url"; then
-                echo "Downloaded from $url -> $out"
-                # quick validation: ensure tar can list it
+                    --connect-timeout 15 --max-time 300 -o "$out" "$url"; then
+                echo "Downloaded $out from $url"
                 if tar -tf "$out" >/dev/null 2>&1; then
-                  echo "Archive $out looks valid; extracting..."
+                  echo "Archive valid; extracting..."
                   tar -xf "$out"
                   rm -f "$out" || true
                   return 0
                 else
-                  echo "Downloaded file $out from $url is not a valid tar archive; inspecting head"
+                  echo "Downloaded file $out is not a valid tar archive; inspecting..."
                   file "$out" || true
                   head -c 512 "$out" | sed -n '1,200p' || true
                   rm -f "$out" || true
                 fi
               else
-                echo "Failed to download from $url (curl exit $?); trying next mirror..."
+                echo "curl failed for $url; trying next mirror..."
                 rm -f "$out" || true
                 sleep 2
               fi
@@ -128,7 +119,6 @@ jobs:
             return 1
           }
 
-          # GCC
           if [ ! -d "gcc-src" ]; then
             download_and_extract "GCC ${GCC_VERSION}" "gcc.tar.xz" \
               "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz" \
@@ -138,7 +128,6 @@ jobs:
             echo "gcc-src exists - using cache"
           fi
 
-          # GMP - prefer ftp.gnu mirror if gmplib.org unreachable
           if [ ! -d "gcc-src/gmp" ]; then
             download_and_extract "GMP ${GMP_VERSION}" "gmp.tar.xz" \
               "https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz" \
@@ -149,7 +138,6 @@ jobs:
             echo "gmp already present"
           fi
 
-          # MPFR - prefer ftp.gnu
           if [ ! -d "gcc-src/mpfr" ]; then
             download_and_extract "MPFR ${MPFR_VERSION}" "mpfr.tar.xz" \
               "https://www.mpfr.org/mpfr-${MPFR_VERSION}/mpfr-${MPFR_VERSION}.tar.xz" \
@@ -160,7 +148,6 @@ jobs:
             echo "mpfr already present"
           fi
 
-          # MPC - use ftp.gnu first then mirror
           if [ ! -d "gcc-src/mpc" ]; then
             download_and_extract "MPC ${MPC_VERSION}" "mpc.tar.gz" \
               "https://ftp.gnu.org/gnu/mpc/mpc-${MPC_VERSION}.tar.gz" \
@@ -170,7 +157,6 @@ jobs:
             echo "mpc already present"
           fi
 
-          # ISL - try ftp.gnu then sourceforge
           if [ ! -d "gcc-src/isl" ]; then
             download_and_extract "ISL ${ISL_VERSION}" "isl.tar.xz" \
               "https://libisl.sourceforge.io/isl-${ISL_VERSION}.tar.xz" \
@@ -181,7 +167,6 @@ jobs:
             echo "isl already present"
           fi
 
-          echo "Thirdparty prepared (du):"
           du -sh . || true
           ls -la || true
 
@@ -198,24 +183,28 @@ jobs:
           mkdir -p build
           ls -la thirdparty/gcc-src || true
 
-      - name: Configure GCC (C,C++,Fortran) - conservative
+      - name: Configure GCC (C,C++,Fortran) - corrected for host compiler
         run: |
           set -euo pipefail
           SDK="${{ steps.sdk.outputs.sdk }}"
           CORES="${{ steps.cores.outputs.cores }}"
           cd build
-          export CC="ccache $(xcrun --sdk iphoneos -f clang)"
-          export CXX="ccache $(xcrun --sdk iphoneos -f clang++)"
-          export SDKROOT="$SDK"
-          export CFLAGS="-isysroot ${SDK} -O2 -pipe -fPIC -fno-common"
+
+          # Use host clang (no iphoneos sysroot flags) to build stage1 host compiler.
+          export CC="ccache clang"
+          export CXX="ccache clang++"
+          # minimal host compile flags (do NOT use -isysroot for host compiler)
+          export CFLAGS="-O2 -pipe -fno-common"
           export CXXFLAGS="$CFLAGS -std=gnu++17"
-          export LDFLAGS="-isysroot ${SDK} -Wl,-syslibroot,${SDK}"
-          export AS="$(xcrun --sdk iphoneos -f as)"
-          export LD="$(xcrun --sdk iphoneos -f ld)"
+          # pass target sysroot to configure so cross-compiler knows target sysroot
+          export TARGET_SYSROOT="$SDK"
+
           ../thirdparty/gcc-src/configure \
+            --build=$(../thirdparty/gcc-src/config.guess) \
+            --host=$(../thirdparty/gcc-src/config.guess) \
             --target=${{ env.TARGET }} \
             --prefix=${{ env.PREFIX }} \
-            --with-sysroot="${SDK}" \
+            --with-sysroot="${TARGET_SYSROOT}" \
             --enable-languages=c,c++,fortran \
             --disable-bootstrap \
             --disable-multilib \
@@ -230,7 +219,7 @@ jobs:
             --with-mpfr=../thirdparty/gcc-src/mpfr \
             --with-mpc=../thirdparty/gcc-src/mpc \
             --with-isl=../thirdparty/gcc-src/isl \
-            CC="$CC" CXX="$CXX" CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS" LDFLAGS="$LDFLAGS"
+            CC="$CC" CXX="$CXX" CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS"
 
       - name: Build minimal (all-gcc + libgcc + libgfortran best-effort)
         run: |

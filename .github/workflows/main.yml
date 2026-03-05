@@ -36,6 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           brew update
+          # install required libs (gmp/mpfr/libmpc/isl from brew for reliable detection)
           brew install autoconf automake libtool gawk gmp mpfr libmpc isl \
                        python@3 bison texinfo wget cmake pkg-config xz ccache ruby
 
@@ -81,7 +82,28 @@ jobs:
           echo "cores=$CORES" >> $GITHUB_OUTPUT
           echo "host_cores=$HOST_CORES" >> $GITHUB_OUTPUT
 
-      - name: Download GCC + in-tree prerequisites (robust, with retries & mirrors)
+      - name: Gather brew prefixes (gmp/mpfr/libmpc/isl)
+        id: brew_prefixes
+        run: |
+          set -euo pipefail
+          # Use brew --prefix to find correct location on ARM/Intel runners
+          GMP_PREFIX=$(brew --prefix gmp 2>/dev/null || echo "")
+          MPFR_PREFIX=$(brew --prefix mpfr 2>/dev/null || echo "")
+          MPC_PREFIX=$(brew --prefix libmpc 2>/dev/null || echo "")
+          ISL_PREFIX=$(brew --prefix isl 2>/dev/null || echo "")
+
+          echo "gmp_prefix=$GMP_PREFIX" >> $GITHUB_OUTPUT
+          echo "mpfr_prefix=$MPFR_PREFIX" >> $GITHUB_OUTPUT
+          echo "mpc_prefix=$MPC_PREFIX" >> $GITHUB_OUTPUT
+          echo "isl_prefix=$ISL_PREFIX" >> $GITHUB_OUTPUT
+
+          echo "Found prefixes:"
+          echo "GMP: $GMP_PREFIX"
+          echo "MPFR: $MPFR_PREFIX"
+          echo "MPC: $MPC_PREFIX"
+          echo "ISL: $ISL_PREFIX"
+
+      - name: Download GCC + (in-tree fallback) prerequisites (robust)
         run: |
           set -euo pipefail
           mkdir -p thirdparty
@@ -128,45 +150,36 @@ jobs:
             echo "gcc-src exists - using cache"
           fi
 
+          # Optional: still fetch in-tree copies as fallback if brew detection fails
           if [ ! -d "gcc-src/gmp" ]; then
             download_and_extract "GMP ${GMP_VERSION}" "gmp.tar.xz" \
-              "https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz" \
               "https://ftp.gnu.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz" \
               "https://mirrors.kernel.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz"
-            mv "gmp-${GMP_VERSION}" gcc-src/gmp
-          else
-            echo "gmp already present"
+            mv "gmp-${GMP_VERSION}" gcc-src/gmp || true
           fi
 
           if [ ! -d "gcc-src/mpfr" ]; then
             download_and_extract "MPFR ${MPFR_VERSION}" "mpfr.tar.xz" \
-              "https://www.mpfr.org/mpfr-${MPFR_VERSION}/mpfr-${MPFR_VERSION}.tar.xz" \
               "https://ftp.gnu.org/gnu/mpfr/mpfr-${MPFR_VERSION}.tar.xz" \
               "https://mirrors.kernel.org/gnu/mpfr/mpfr-${MPFR_VERSION}.tar.xz"
-            mv "mpfr-${MPFR_VERSION}" gcc-src/mpfr
-          else
-            echo "mpfr already present"
+            mv "mpfr-${MPFR_VERSION}" gcc-src/mpfr || true
           fi
 
           if [ ! -d "gcc-src/mpc" ]; then
             download_and_extract "MPC ${MPC_VERSION}" "mpc.tar.gz" \
               "https://ftp.gnu.org/gnu/mpc/mpc-${MPC_VERSION}.tar.gz" \
               "https://mirrors.kernel.org/gnu/mpc/mpc-${MPC_VERSION}.tar.gz"
-            mv "mpc-${MPC_VERSION}" gcc-src/mpc
-          else
-            echo "mpc already present"
+            mv "mpc-${MPC_VERSION}" gcc-src/mpc || true
           fi
 
           if [ ! -d "gcc-src/isl" ]; then
             download_and_extract "ISL ${ISL_VERSION}" "isl.tar.xz" \
-              "https://libisl.sourceforge.io/isl-${ISL_VERSION}.tar.xz" \
               "https://ftp.gnu.org/gnu/isl/isl-${ISL_VERSION}.tar.xz" \
               "https://mirrors.kernel.org/gnu/isl/isl-${ISL_VERSION}.tar.xz"
-            mv "isl-${ISL_VERSION}" gcc-src/isl
-          else
-            echo "isl already present"
+            mv "isl-${ISL_VERSION}" gcc-src/isl || true
           fi
 
+          echo "Thirdparty prepared (du):"
           du -sh . || true
           ls -la || true
 
@@ -181,30 +194,45 @@ jobs:
           set -euo pipefail
           rm -rf build || true
           mkdir -p build
+          echo "Contents of thirdparty/gcc-src (before configure):"
           ls -la thirdparty/gcc-src || true
 
-      - name: Configure GCC (C,C++,Fortran) - corrected for host compiler
+      - name: Configure GCC (host clang, pass brew prefixes)
         run: |
           set -euo pipefail
           SDK="${{ steps.sdk.outputs.sdk }}"
           CORES="${{ steps.cores.outputs.cores }}"
+          GMP_PREFIX="${{ steps.brew_prefixes.outputs.gmp_prefix }}"
+          MPFR_PREFIX="${{ steps.brew_prefixes.outputs.mpfr_prefix }}"
+          MPC_PREFIX="${{ steps.brew_prefixes.outputs.mpc_prefix }}"
+          ISL_PREFIX="${{ steps.brew_prefixes.outputs.isl_prefix }}"
+
+          # If brew --prefix variables empty (rare), fallback to standard locations
+          if [ -z "$GMP_PREFIX" ]; then GMP_PREFIX="/usr/local"; fi
+          if [ -z "$MPFR_PREFIX" ]; then MPFR_PREFIX="/usr/local"; fi
+          if [ -z "$MPC_PREFIX" ]; then MPC_PREFIX="/usr/local"; fi
+          if [ -z "$ISL_PREFIX" ]; then ISL_PREFIX="/usr/local"; fi
+
+          echo "Using GMP_PREFIX=$GMP_PREFIX MPFR_PREFIX=$MPFR_PREFIX MPC_PREFIX=$MPC_PREFIX ISL_PREFIX=$ISL_PREFIX"
           cd build
 
-          # Use host clang (no iphoneos sysroot flags) to build stage1 host compiler.
+          # Build stage1 host compiler with macOS clang (no -isysroot for host)
           export CC="ccache clang"
           export CXX="ccache clang++"
-          # minimal host compile flags (do NOT use -isysroot for host compiler)
-          export CFLAGS="-O2 -pipe -fno-common"
+          export CFLAGS="-O2 -pipe -fno-common -g0"
           export CXXFLAGS="$CFLAGS -std=gnu++17"
-          # pass target sysroot to configure so cross-compiler knows target sysroot
-          export TARGET_SYSROOT="$SDK"
 
+          # Pass explicit --with-* to configure so it finds headers/libs from brew
           ../thirdparty/gcc-src/configure \
             --build=$(../thirdparty/gcc-src/config.guess) \
             --host=$(../thirdparty/gcc-src/config.guess) \
             --target=${{ env.TARGET }} \
             --prefix=${{ env.PREFIX }} \
-            --with-sysroot="${TARGET_SYSROOT}" \
+            --with-sysroot="${SDK}" \
+            --with-gmp="${GMP_PREFIX}" \
+            --with-mpfr="${MPFR_PREFIX}" \
+            --with-mpc="${MPC_PREFIX}" \
+            --with-isl="${ISL_PREFIX}" \
             --enable-languages=c,c++,fortran \
             --disable-bootstrap \
             --disable-multilib \
@@ -215,10 +243,6 @@ jobs:
             --disable-libvtv \
             --disable-libmudflap \
             --enable-threads=posix \
-            --with-gmp=../thirdparty/gcc-src/gmp \
-            --with-mpfr=../thirdparty/gcc-src/mpfr \
-            --with-mpc=../thirdparty/gcc-src/mpc \
-            --with-isl=../thirdparty/gcc-src/isl \
             CC="$CC" CXX="$CXX" CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS"
 
       - name: Build minimal (all-gcc + libgcc + libgfortran best-effort)

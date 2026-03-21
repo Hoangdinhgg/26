@@ -10,7 +10,7 @@ jobs:
     runs-on: macos-latest
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Compile storyboards
       run: |
@@ -28,7 +28,7 @@ jobs:
         ls -la Resources/Base.lproj/
     
     - name: Upload
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: storyboards
         path: Resources/Base.lproj/

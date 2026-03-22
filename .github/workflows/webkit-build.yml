@@ -54,17 +54,30 @@ jobs:
         run: |
           set -euxo pipefail
 
+          RUNNER_ARCH="$(uname -m)"
+          if [ "$RUNNER_ARCH" = "arm64" ]; then
+            BUILD_ARCH="arm64"
+          else
+            BUILD_ARCH="x86_64"
+          fi
+
           OUTDIR="$OUTROOT/$COMPONENT"
-          mkdir -p "$OUTDIR/SYMROOT" "$OUTDIR/DSTROOT"
+          mkdir -p "$OUTDIR/DerivedData" "$OUTDIR/Artifacts"
 
           xcodebuild \
             -workspace WebKit.xcworkspace \
             -scheme "$COMPONENT" \
             -configuration "$CONFIGURATION" \
             -sdk "$SDK" \
-            SYMROOT="$OUTDIR/SYMROOT" \
-            DSTROOT="$OUTDIR/DSTROOT" \
+            -derivedDataPath "$OUTDIR/DerivedData" \
+            ONLY_ACTIVE_ARCH=YES \
+            ARCHS="$BUILD_ARCH" \
             build
+
+          # Collect whatever got produced for later inspection.
+          if [ -d "$OUTDIR/DerivedData/Build/Products/$CONFIGURATION-iphonesimulator" ]; then
+            cp -R "$OUTDIR/DerivedData/Build/Products/$CONFIGURATION-iphonesimulator" "$OUTDIR/Artifacts/" || true
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
